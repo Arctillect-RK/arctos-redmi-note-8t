@@ -1,0 +1,12 @@
+ArctOS for the Xiaomi Redmi Note 8T is a collection with mixed licenses:
+
+- patches/kernel/*, drivers/*, dts/*  : GPL-2.0-only (same as the Linux kernel)
+- patches/phosh/*                     : GPL-3.0-or-later (same as Phosh)
+- everything else (tools, scripts, rootfs configs, theme code, wallpapers): GPL-3.0-or-later
+- generated icons: CC BY-SA 3.0 (they include Adwaita symbolic glyphs)
+
+Full texts: https://www.gnu.org/licenses/gpl-2.0.html , https://www.gnu.org/licenses/gpl-3.0.html ,
+https://creativecommons.org/licenses/by-sa/3.0/
+
+Proprietary Qualcomm/Xiaomi firmware is NOT included and NOT redistributed.
+See docs/CREDITS.md.

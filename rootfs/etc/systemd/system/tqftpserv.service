@@ -1,0 +1,11 @@
+[Unit]
+Description=QRTR TFTP service (serves wlanmdsp.mbn etc. to the modem)
+Before=rmtfs.service
+
+[Service]
+ExecStart=/usr/sbin/tqftpserv
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

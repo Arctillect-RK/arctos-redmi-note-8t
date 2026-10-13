@@ -1,0 +1,581 @@
+diff --git a/src/lockscreen.c b/src/lockscreen.c
+index c991cb0..1aff33f 100644
+--- a/src/lockscreen.c
++++ b/src/lockscreen.c
+@@ -453,6 +453,23 @@ long_press_del_cb (PhoshLockscreen *self,
+ }
+ 
+ 
++static void submit_cb (PhoshLockscreen *self);
++static gboolean auto_submit_idle_cb (gpointer data);
++
++static guint
++phosh_lockscreen_get_auto_submit_length (void)
++{
++  static gint len = -1;
++
++  if (len < 0) {
++    const char *env = g_getenv ("PHOSH_PIN_LENGTH");
++
++    len = env ? (gint) g_ascii_strtoull (env, NULL, 10) : 0;
++  }
++  return (guint) len;
++}
++
++
+ static void
+ input_changed_cb (PhoshLockscreen *self)
+ {
+@@ -466,6 +483,10 @@ input_changed_cb (PhoshLockscreen *self)
+   length = gtk_entry_get_text_length (GTK_ENTRY (priv->entry_pin));
+ 
+   gtk_widget_set_sensitive (priv->btn_submit, length != 0);
++
++  /* willow: submit as soon as the PIN has the configured length (PHOSH_PIN_LENGTH) */
++  if (length > 0 && length == phosh_lockscreen_get_auto_submit_length () && priv->auth == NULL)
++    g_idle_add_full (G_PRIORITY_DEFAULT_IDLE, auto_submit_idle_cb, g_object_ref (self), g_object_unref);
+ }
+ 
+ 
+@@ -479,6 +500,14 @@ submit_cb (PhoshLockscreen *self)
+ }
+ 
+ 
++static gboolean
++auto_submit_idle_cb (gpointer data)
++{
++  submit_cb (PHOSH_LOCKSCREEN (data));
++  return G_SOURCE_REMOVE;
++}
++
++
+ static gboolean
+ key_press_event_cb (PhoshLockscreen *self, GdkEventKey *event, gpointer data)
+ {
+diff --git a/src/activity.c b/src/activity.c
+index 7cc4055..10d8123 100644
+--- a/src/activity.c
++++ b/src/activity.c
+@@ -520,10 +520,9 @@ set_hovering (PhoshActivity *self,
+   priv->hovering = hovering;
+ 
+   /* Revealer won't animate if not mapped, show it preemptively */
+-  if (hovering)
+-    gtk_widget_set_visible (priv->revealer_close, TRUE);
+-
+-  gtk_revealer_set_reveal_child (GTK_REVEALER (priv->revealer_close), hovering);
++  /* willow: the close button stays visible (touch has no hover), see set_thumbnail */
++  gtk_widget_set_visible (priv->revealer_close, TRUE);
++  gtk_revealer_set_reveal_child (GTK_REVEALER (priv->revealer_close), TRUE);
+ }
+ 
+ 
+@@ -839,6 +838,10 @@ phosh_activity_set_thumbnail (PhoshActivity *self, PhoshThumbnail *thumbnail)
+   gtk_widget_set_margin_start (priv->btn_unfullscreen, margin);
+   gtk_widget_set_margin_end (priv->btn_close, margin);
+ 
++  /* willow: touch screens never "hover", so keep the close button visible */
++  gtk_widget_set_visible (priv->revealer_close, TRUE);
++  gtk_revealer_set_reveal_child (GTK_REVEALER (priv->revealer_close), TRUE);
++
+   gtk_widget_queue_draw (GTK_WIDGET (self));
+ 
+   if (has_thumbnail != !!priv->thumbnail)
+diff --git a/src/overview.c b/src/overview.c
+index 8df50c7..10adc94 100644
+--- a/src/overview.c
++++ b/src/overview.c
+@@ -21,9 +21,15 @@
+ #include "util.h"
+ 
+ #include <gio/gdesktopappinfo.h>
++#include <glib/gstdio.h>
+ 
+ #include <handy.h>
+ 
++#include <signal.h>
++#include <string.h>
++#include <sys/types.h>
++#include <unistd.h>
++
+ #define OVERVIEW_ICON_SIZE 64
+ 
+ /**
+@@ -321,6 +327,99 @@ on_activity_clicked (PhoshOverview *self, PhoshActivity *activity)
+ }
+ 
+ 
++/*
++ * willow: force-close apps that ignore the close request.
++ * 3 s after asking a toplevel to close, if it is still alive, kill the user's
++ * processes whose argv[0] matches the app's .desktop Exec (or app-id tail).
++ */
++typedef struct {
++  GWeakRef  toplevel;
++  char     *app_id;
++} ForceCloseData;
++
++
++static void
++force_close_data_free (gpointer data)
++{
++  ForceCloseData *fc = data;
++
++  g_weak_ref_clear (&fc->toplevel);
++  g_free (fc->app_id);
++  g_free (fc);
++}
++
++
++static char *
++force_close_get_exe_name (const char *app_id)
++{
++  g_autoptr (GDesktopAppInfo) info = phosh_get_desktop_app_info_for_app_id (app_id);
++  const char *exe = info ? g_app_info_get_executable (G_APP_INFO (info)) : NULL;
++  const char *dot;
++
++  if (exe && *exe)
++    return g_path_get_basename (exe);
++
++  dot = strrchr (app_id, '.');
++  return g_ascii_strdown (dot ? dot + 1 : app_id, -1);
++}
++
++
++static void
++force_close_kill (const char *app_id)
++{
++  g_autofree char *exe = force_close_get_exe_name (app_id);
++  g_autoptr (GDir) dir = g_dir_open ("/proc", 0, NULL);
++  const char *name;
++  uid_t uid = getuid ();
++  pid_t self_pid = getpid ();
++
++  if (!dir || !exe || !*exe)
++    return;
++
++  while ((name = g_dir_read_name (dir))) {
++    g_autofree char *proc_path = NULL, *cmdline_path = NULL, *cmdline = NULL;
++    g_autofree char *argv0 = NULL;
++    GStatBuf st;
++    gsize len = 0;
++    pid_t pid;
++
++    if (!g_ascii_isdigit (name[0]))
++      continue;
++    pid = (pid_t) g_ascii_strtoll (name, NULL, 10);
++    if (pid == self_pid)
++      continue;
++
++    proc_path = g_build_filename ("/proc", name, NULL);
++    if (g_stat (proc_path, &st) != 0 || st.st_uid != uid)
++      continue;
++
++    cmdline_path = g_build_filename ("/proc", name, "cmdline", NULL);
++    if (!g_file_get_contents (cmdline_path, &cmdline, &len, NULL) || len == 0)
++      continue;
++
++    argv0 = g_path_get_basename (cmdline);
++    if (g_strcmp0 (argv0, exe) == 0) {
++      g_message ("Force closing %s (pid %d, %s)", app_id, pid, exe);
++      kill (pid, SIGKILL);
++    }
++  }
++}
++
++
++static gboolean
++force_close_timeout_cb (gpointer data)
++{
++  ForceCloseData *fc = data;
++  g_autoptr (PhoshToplevel) toplevel = g_weak_ref_get (&fc->toplevel);
++
++  /* still around after the close request: the app ignored it */
++  if (toplevel)
++    force_close_kill (fc->app_id);
++
++  return G_SOURCE_REMOVE;
++}
++
++
+ static void
+ on_activity_closed (PhoshOverview *self, PhoshActivity *activity)
+ {
+@@ -338,6 +437,16 @@ on_activity_closed (PhoshOverview *self, PhoshActivity *activity)
+ 
+   phosh_toplevel_close (toplevel);
+   phosh_trigger_feedback ("window-close", FALSE);
++
++  if (phosh_activity_get_app_id (activity)) {
++    ForceCloseData *fc = g_new0 (ForceCloseData, 1);
++
++    g_weak_ref_init (&fc->toplevel, toplevel);
++    fc->app_id = g_strdup (phosh_activity_get_app_id (activity));
++    g_timeout_add_seconds_full (G_PRIORITY_DEFAULT, 3, force_close_timeout_cb, fc,
++                                force_close_data_free);
++  }
++
+   g_signal_emit (self, signals[ACTIVITY_CLOSED], 0);
+ }
+ 
+diff --git a/src/app-grid.c b/src/app-grid.c
+index aa3837e..a1e8b57 100644
+--- a/src/app-grid.c
++++ b/src/app-grid.c
+@@ -21,6 +21,7 @@
+ #include "gtk-list-models/gtkfilterlistmodel.h"
+ 
+ #include <gmobile.h>
++#include <handy.h>
+ 
+ #define ACTIVE_SEARCH_CLASS "search-active"
+ 
+@@ -72,8 +73,16 @@ struct _PhoshAppGridPrivate {
+   GSimpleActionGroup *actions;
+   PhoshAppFilterModeFlags filter_mode;
+   guint debounce;
++
++  /* ArctOS: iOS-like home screen: fixed 4x5 pages in a carousel */
++  GtkWidget  *pages;
++  GtkWidget  *page_dots;
++  guint       pages_idle_id;
+ };
+ 
++#define ARCTOS_PAGE_COLS 4
++#define ARCTOS_PAGE_ROWS 5
++
+ G_DEFINE_TYPE_WITH_PRIVATE (PhoshAppGrid, phosh_app_grid, GTK_TYPE_BOX)
+ 
+ static void
+@@ -420,6 +429,106 @@ create_launcher (gpointer item, gpointer self)
+ }
+ 
+ 
++/*
++ * ArctOS home screen: apps are laid out row by row on pages of
++ * ARCTOS_PAGE_COLS x ARCTOS_PAGE_ROWS buttons inside a HdyCarousel, which
++ * provides the sideways swipe with snapping and the page indicator dots.
++ * The original flowbox stays bound (hidden) for search focus and folder lookups.
++ */
++static void
++arctos_rebuild_pages (PhoshAppGrid *self)
++{
++  PhoshAppGridPrivate *priv = phosh_app_grid_get_instance_private (self);
++  g_autoptr (GList) old_pages = NULL;
++  GtkWidget *grid = NULL;
++  guint n_items, per_page = ARCTOS_PAGE_COLS * ARCTOS_PAGE_ROWS;
++
++  old_pages = gtk_container_get_children (GTK_CONTAINER (priv->pages));
++  for (GList *l = old_pages; l; l = l->next)
++    gtk_container_remove (GTK_CONTAINER (priv->pages), GTK_WIDGET (l->data));
++
++  n_items = g_list_model_get_n_items (G_LIST_MODEL (priv->model));
++  for (guint i = 0; i < n_items; i++) {
++    g_autoptr (GObject) item = g_list_model_get_item (G_LIST_MODEL (priv->model), i);
++    guint slot = i % per_page;
++    GtkWidget *btn;
++
++    if (slot == 0) {
++      grid = gtk_grid_new ();
++      gtk_grid_set_column_homogeneous (GTK_GRID (grid), TRUE);
++      gtk_grid_set_row_spacing (GTK_GRID (grid), 6);
++      gtk_widget_set_hexpand (grid, TRUE);
++      gtk_widget_set_valign (grid, GTK_ALIGN_START);
++      gtk_style_context_add_class (gtk_widget_get_style_context (grid), "arctos-page");
++      gtk_widget_set_visible (grid, TRUE);
++      hdy_carousel_insert (HDY_CAROUSEL (priv->pages), grid, -1);
++    }
++
++    btn = create_launcher (item, self);
++    gtk_grid_attach (GTK_GRID (grid), btn, slot % ARCTOS_PAGE_COLS, slot / ARCTOS_PAGE_COLS, 1, 1);
++  }
++
++  /* keep empty columns of the first row so a page with 1-3 apps is not stretched */
++  if (n_items > 0 && n_items < ARCTOS_PAGE_COLS && grid) {
++    for (guint c = n_items; c < ARCTOS_PAGE_COLS; c++) {
++      GtkWidget *spacer = gtk_label_new (NULL);
++
++      gtk_widget_set_visible (spacer, TRUE);
++      gtk_grid_attach (GTK_GRID (grid), spacer, c, 0, 1, 1);
++    }
++  }
++}
++
++
++static gboolean
++arctos_rebuild_pages_idle (gpointer data)
++{
++  PhoshAppGrid *self = PHOSH_APP_GRID (data);
++  PhoshAppGridPrivate *priv = phosh_app_grid_get_instance_private (self);
++
++  priv->pages_idle_id = 0;
++  arctos_rebuild_pages (self);
++  return G_SOURCE_REMOVE;
++}
++
++
++static void
++arctos_queue_rebuild_pages (PhoshAppGrid *self)
++{
++  PhoshAppGridPrivate *priv = phosh_app_grid_get_instance_private (self);
++
++  if (priv->pages_idle_id == 0)
++    priv->pages_idle_id = g_idle_add (arctos_rebuild_pages_idle, self);
++}
++
++
++static void
++arctos_scroll_to_first_page (PhoshAppGrid *self)
++{
++  PhoshAppGridPrivate *priv = phosh_app_grid_get_instance_private (self);
++  g_autoptr (GList) pages = gtk_container_get_children (GTK_CONTAINER (priv->pages));
++
++  if (pages)
++    hdy_carousel_scroll_to_full (HDY_CAROUSEL (priv->pages), GTK_WIDGET (pages->data), 0);
++}
++
++
++static void
++arctos_setup_paging (PhoshAppGrid *self)
++{
++  PhoshAppGridPrivate *priv = phosh_app_grid_get_instance_private (self);
++
++  /* the flowbox is only kept for search focus / folder index lookups */
++  gtk_widget_set_visible (priv->scrolled_window, FALSE);
++  /* "Show all apps" toggle makes no sense with fixed pages: always show everything */
++  gtk_widget_set_visible (priv->btn_adaptive, FALSE);
++
++  g_signal_connect_swapped (priv->model, "items-changed",
++                            G_CALLBACK (arctos_queue_rebuild_pages), self);
++  arctos_rebuild_pages (self);
++}
++
++
+ static void
+ phosh_app_grid_init (PhoshAppGrid *self)
+ {
+@@ -457,6 +566,7 @@ phosh_app_grid_init (PhoshAppGrid *self)
+                            create_launcher,
+                            self,
+                            NULL);
++  arctos_setup_paging (self);
+ 
+   priv->settings = g_settings_new ("sm.puri.phosh");
+   g_object_connect (priv->settings,
+@@ -484,6 +594,7 @@ phosh_app_grid_dispose (GObject *object)
+   g_clear_object (&priv->actions);
+   g_clear_object (&priv->model);
+   g_clear_object (&priv->settings);
++  g_clear_handle_id (&priv->pages_idle_id, g_source_remove);
+   g_clear_handle_id (&priv->debounce, g_source_remove);
+ 
+   G_OBJECT_CLASS (phosh_app_grid_parent_class)->dispose (object);
+@@ -530,6 +641,7 @@ do_search (gpointer data)
+   if (gm_str_is_null_or_empty (priv->search_string)) {
+     adjustment = gtk_scrolled_window_get_vadjustment (GTK_SCROLLED_WINDOW (priv->scrolled_window));
+     gtk_adjustment_set_value (adjustment, 0);
++    arctos_scroll_to_first_page (self);
+     search_active = FALSE;
+   }
+ 
+@@ -723,6 +835,8 @@ phosh_app_grid_class_init (PhoshAppGridClass *klass)
+   gtk_widget_class_bind_template_child_private (widget_class, PhoshAppGrid, folder_name_label);
+   gtk_widget_class_bind_template_child_private (widget_class, PhoshAppGrid, folder_stack);
+   gtk_widget_class_bind_template_child_private (widget_class, PhoshAppGrid, scrolled_window);
++  gtk_widget_class_bind_template_child_private (widget_class, PhoshAppGrid, page_dots);
++  gtk_widget_class_bind_template_child_private (widget_class, PhoshAppGrid, pages);
+   gtk_widget_class_bind_template_child_private (widget_class, PhoshAppGrid, search);
+ 
+   gtk_widget_class_bind_template_callback (widget_class, on_folder_edit_toggled);
+@@ -758,6 +872,7 @@ phosh_app_grid_reset (PhoshAppGrid *self)
+   adjustment = gtk_scrolled_window_get_vadjustment (GTK_SCROLLED_WINDOW (priv->scrolled_window));
+ 
+   gtk_adjustment_set_value (adjustment, 0);
++  arctos_scroll_to_first_page (self);
+   gtk_entry_set_text (GTK_ENTRY (priv->search), "");
+   g_clear_pointer (&priv->search_string, g_free);
+ 
+diff --git a/src/lockscreen-bg.c b/src/lockscreen-bg.c
+index df2b037..c0c54fd 100644
+--- a/src/lockscreen-bg.c
++++ b/src/lockscreen-bg.c
+@@ -35,6 +35,9 @@ struct _PhoshLockscreenBg {
+ 
+   gboolean              configured;
+   gboolean              use_background;
++
++  /* ArctOS: separate lock screen picture (org.gnome.desktop.screensaver picture-uri) */
++  GSettings            *lock_settings;
+ };
+ G_DEFINE_TYPE (PhoshLockscreenBg, phosh_lockscreen_bg, PHOSH_TYPE_LAYER_SURFACE)
+ 
+@@ -58,6 +61,17 @@ update_image (PhoshLockscreenBg *self)
+   g_debug ("Scaling lockscreen background %p to %dx%d", self, width, height);
+ 
+   g_clear_object (&self->pixbuf);
++  if (self->lock_settings) {
++    g_autofree char *uri = g_settings_get_string (self->lock_settings, "picture-uri");
++    g_autofree char *path = gm_str_is_null_or_empty (uri) ? NULL : g_filename_from_uri (uri, NULL, NULL);
++    g_autoptr (GdkPixbuf) lock_pixbuf = path ? gdk_pixbuf_new_from_file (path, NULL) : NULL;
++
++    if (lock_pixbuf) {
++      self->pixbuf = phosh_utils_pixbuf_scale_to_min (lock_pixbuf, width * scale, height * scale);
++      gtk_widget_queue_draw (GTK_WIDGET (self));
++      return;
++    }
++  }
+   if (self->bg_image) {
+     GdkPixbuf *pixbuf = phosh_background_image_get_pixbuf (self->bg_image);
+     self->pixbuf = phosh_utils_pixbuf_scale_to_min (pixbuf, width * scale, height * scale);
+@@ -131,6 +145,7 @@ phosh_lockscreen_bg_finalize (GObject *object)
+ 
+   g_clear_object (&self->bg_image);
+   g_clear_object (&self->pixbuf);
++  g_clear_object (&self->lock_settings);
+ 
+   G_OBJECT_CLASS (phosh_lockscreen_bg_parent_class)->finalize (object);
+ }
+@@ -165,6 +180,10 @@ phosh_lockscreen_bg_init (PhoshLockscreenBg *self)
+                            G_CALLBACK (on_theme_name_changed),
+                            self,
+                            G_CONNECT_SWAPPED);
++
++  self->lock_settings = g_settings_new ("org.gnome.desktop.screensaver");
++  g_signal_connect_object (self->lock_settings, "changed::picture-uri",
++                           G_CALLBACK (update_image), self, G_CONNECT_SWAPPED);
+ }
+ 
+ 
+diff --git a/src/ui/app-grid.ui b/src/ui/app-grid.ui
+index 02b3095..6945167 100644
+--- a/src/ui/app-grid.ui
++++ b/src/ui/app-grid.ui
+@@ -45,59 +45,30 @@
+                 <property name="visible">1</property>
+                 <property name="hexpand">1</property>
+                 <property name="vexpand">1</property>
++                <property name="hscrollbar-policy">external</property>
++                <property name="vscrollbar-policy">never</property>
++                <property name="kinetic-scrolling">0</property>
+                 <child>
+                   <object class="GtkBox">
+                     <property name="visible">1</property>
+                     <property name="valign">start</property>
+                     <property name="orientation">vertical</property>
+-                    <child>
+-                      <object class="GtkRevealer" id="favs_revealer">
+-                        <property name="visible">1</property>
+-                        <property name="valign">start</property>
+-                        <property name="reveal-child">1</property>
+-                        <child>
+-                          <object class="GtkBox">
+-                            <property name="visible">1</property>
+-                            <property name="orientation">vertical</property>
+-                            <child>
+-                              <object class="GtkFlowBox" id="favs">
+-                                <property name="visible">1</property>
+-                                <property name="margin-start">3</property>
+-                                <property name="margin-end">3</property>
+-                                <property name="margin-top">6</property>
+-                                <property name="margin-bottom">12</property>
+-                                <property name="hexpand">1</property>
+-                                <property name="homogeneous">1</property>
+-                                <property name="selection-mode">none</property>
+-                                <property name="activate-on-single-click">0</property>
+-                                <property name="column-spacing">6</property>
+-                                <property name="row-spacing">6</property>
+-                              </object>
+-                            </child>
+-                            <child>
+-                              <object class="GtkSeparator">
+-                                <property name="visible">1</property>
+-                                <property name="margin-start">6</property>
+-                                <property name="margin-end">6</property>
+-                              </object>
+-                            </child>
+-                          </object>
+-                        </child>
+-                      </object>
+-                    </child>
+                     <child>
+                       <object class="GtkFlowBox" id="apps">
+                         <property name="visible">1</property>
++                        <property name="orientation">vertical</property>
++                        <property name="min-children-per-line">5</property>
++                        <property name="max-children-per-line">5</property>
+                         <property name="margin-top">12</property>
+-                        <property name="margin-start">3</property>
+-                        <property name="margin-end">3</property>
++                        <property name="margin-start">0</property>
++                        <property name="margin-end">0</property>
+                         <property name="margin-bottom">3</property>
+-                        <property name="hexpand">1</property>
++                        <property name="hexpand">0</property>
+                         <property name="valign">start</property>
+                         <property name="homogeneous">1</property>
+                         <property name="selection-mode">none</property>
+                         <property name="activate-on-single-click">0</property>
+-                        <property name="column-spacing">6</property>
++                        <property name="column-spacing">0</property>
+                         <property name="row-spacing">6</property>
+                       </object>
+                     </child>
+@@ -141,6 +112,58 @@
+                 </child>
+               </object>
+             </child>
++        <child>
++          <object class="HdyCarousel" id="pages">
++            <property name="visible">1</property>
++            <property name="vexpand">1</property>
++            <property name="valign">fill</property>
++            <property name="allow-long-swipes">0</property>
++            <property name="margin-top">10</property>
++          </object>
++        </child>
++        <child>
++          <object class="HdyCarouselIndicatorDots" id="page_dots">
++            <property name="visible">1</property>
++            <property name="carousel">pages</property>
++            <property name="halign">center</property>
++            <style>
++              <class name="arctos-page-dots"/>
++            </style>
++          </object>
++        </child>
++        <child>
++          <object class="GtkRevealer" id="favs_revealer">
++            <property name="visible">1</property>
++            <property name="valign">end</property>
++            <property name="reveal-child">1</property>
++            <child>
++              <object class="GtkBox">
++                <style>
++                  <class name="phosh-dock"/>
++                </style>
++                <property name="visible">1</property>
++                <property name="orientation">vertical</property>
++                <child>
++                  <object class="GtkFlowBox" id="favs">
++                    <property name="visible">1</property>
++                    <property name="margin-start">3</property>
++                    <property name="margin-end">3</property>
++                    <property name="margin-top">6</property>
++                    <property name="margin-bottom">6</property>
++                    <property name="min-children-per-line">4</property>
++                    <property name="max-children-per-line">4</property>
++                    <property name="hexpand">1</property>
++                    <property name="homogeneous">1</property>
++                    <property name="selection-mode">none</property>
++                    <property name="activate-on-single-click">0</property>
++                    <property name="column-spacing">6</property>
++                    <property name="row-spacing">6</property>
++                  </object>
++                </child>
++              </object>
++            </child>
++          </object>
++        </child>
+           </object>
+           <packing>
+             <property name="name">main_grid</property>

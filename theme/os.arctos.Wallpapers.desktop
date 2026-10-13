@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Обои
+Name[en]=Wallpapers
+Comment=Обои рабочего стола и экрана блокировки
+Exec=/usr/bin/arctos-wallpapers
+Icon=os.arctos.Wallpapers
+Categories=Settings;DesktopSettings;
+X-Purism-FormFactor=Workstation;Mobile;

@@ -1,0 +1,1 @@
+obj-m += panel-xiaomi-willow-tianma.o

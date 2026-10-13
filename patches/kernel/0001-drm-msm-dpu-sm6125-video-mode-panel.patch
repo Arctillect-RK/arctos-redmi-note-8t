@@ -1,0 +1,32 @@
+--- a/drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_5_4_sm6125.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/catalog/dpu_5_4_sm6125.h
+@@ -156,7 +156,8 @@
+ 		.base = 0x6a800, .len = 0x2c0,
+ 		.type = INTF_DSI,
+ 		.controller_id = 0,
+-		.prog_fetch_lines_worst_case = 24,
++		/* willow/ginkgo Tianma NT36672A: VFP=10 < 24, prefetch lands in DSI BLLP -> MDP FIFO over/underflow */
++		.prog_fetch_lines_worst_case = 0,
+ 		.intr_underrun = DPU_IRQ_IDX(MDP_SSPP_TOP0_INTR, 26),
+ 		.intr_vsync = DPU_IRQ_IDX(MDP_SSPP_TOP0_INTR, 27),
+ 		.intr_tear_rd_ptr = DPU_IRQ_IDX(MDP_INTF1_TEAR_INTR, 2),
+@@ -188,7 +189,7 @@
+ 		{.rd_enable = 1, .wr_enable = 1},
+ 		{.rd_enable = 1, .wr_enable = 0}
+ 	},
+-	.clk_inefficiency_factor = 105,
++	.clk_inefficiency_factor = 218,
+ 	.bw_inefficiency_factor = 120,
+ };
+ 
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_core_perf.c
+@@ -99,7 +99,7 @@
+ 
+ 	mode = &state->adjusted_mode;
+ 
+-	mode_clk = (u64)mode->vtotal * mode->hdisplay * drm_mode_vrefresh(mode);
++	mode_clk = (u64)mode->clock * 1000;
+ 
+ 	drm_atomic_crtc_for_each_plane(plane, crtc) {
+ 		pstate = to_dpu_plane_state(plane->state);

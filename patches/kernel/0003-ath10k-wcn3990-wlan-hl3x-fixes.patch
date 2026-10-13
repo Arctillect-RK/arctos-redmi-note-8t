@@ -1,0 +1,144 @@
+--- a/drivers/net/wireless/ath/ath10k/thermal.c
++++ b/drivers/net/wireless/ath/ath10k/thermal.c
+@@ -130,6 +130,10 @@
+ 
+ 	lockdep_assert_held(&ar->conf_mutex);
+ 
++	/* WCN3990 WLAN.HL.3.x crashes (wlan_process EX) on pdev quiet mode */
++	if (QCA_REV_WCN3990(ar))
++		return;
++
+ 	if (!test_bit(WMI_SERVICE_THERM_THROT, ar->wmi.svc_map))
+ 		return;
+ 
+--- a/drivers/net/wireless/ath/ath10k/wmi-tlv.c
++++ b/drivers/net/wireless/ath/ath10k/wmi-tlv.c
+@@ -1927,8 +1927,14 @@
+ 		cfg->num_tids = __cpu_to_le32(ar->hw_params.num_peers * 2);
+ 	else
+ 		cfg->num_tids = __cpu_to_le32(TARGET_TLV_NUM_TIDS);
+-	cfg->tx_chain_mask = __cpu_to_le32(0x7);
+-	cfg->rx_chain_mask = __cpu_to_le32(0x7);
++	if (QCA_REV_WCN3990(ar) && ar->num_rf_chains > 0 && ar->num_rf_chains < 3) {
++		/* HL.3.x rejects vdevs when INIT advertises more chains than the RF has */
++		cfg->tx_chain_mask = __cpu_to_le32(BIT(ar->num_rf_chains) - 1);
++		cfg->rx_chain_mask = __cpu_to_le32(BIT(ar->num_rf_chains) - 1);
++	} else {
++		cfg->tx_chain_mask = __cpu_to_le32(0x7);
++		cfg->rx_chain_mask = __cpu_to_le32(0x7);
++	}
+ 	cfg->rx_timeout_pri[0] = __cpu_to_le32(0x64);
+ 	cfg->rx_timeout_pri[1] = __cpu_to_le32(0x64);
+ 	cfg->rx_timeout_pri[2] = __cpu_to_le32(0x64);
+--- a/drivers/net/wireless/ath/ath10k/core.h
++++ b/drivers/net/wireless/ath/ath10k/core.h
+@@ -572,6 +572,10 @@
+ };
+ 
+ struct ath10k_vif {
++	/* WCN3990 HL.3.x: STA vdev is started only after the BSS peer exists */
++	bool vdev_start_delayed;
++	struct cfg80211_chan_def delayed_chandef;
++
+ 	struct list_head list;
+ 
+ 	u32 vdev_id;
+--- a/drivers/net/wireless/ath/ath10k/mac.c
++++ b/drivers/net/wireless/ath/ath10k/mac.c
+@@ -7490,6 +7490,8 @@
+ 	ieee80211_queue_work(iter_data->ar->hw, &arsta->tid_config_wk);
+ }
+ 
++static int ath10k_mac_finish_delayed_vdev_start(struct ath10k_vif *arvif);
++
+ static int ath10k_sta_state(struct ieee80211_hw *hw,
+ 			    struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta,
+@@ -7596,6 +7598,16 @@
+ 
+ 		spin_unlock_bh(&ar->data_lock);
+ 
++		if (!sta->tdls && arvif->vdev_start_delayed) {
++			ret = ath10k_mac_finish_delayed_vdev_start(arvif);
++			if (ret) {
++				ath10k_peer_delete(ar, arvif->vdev_id, sta->addr);
++				ath10k_mac_dec_num_stations(arvif, sta);
++				kfree(arsta->tx_stats);
++				goto exit;
++			}
++		}
++
+ 		if (!sta->tdls)
+ 			goto exit;
+ 
+@@ -8980,6 +8992,35 @@
+ 	mutex_unlock(&ar->conf_mutex);
+ }
+ 
++/*
++ * WLAN.HL.3.x on WCN3990 answers vdev-start with status -1 unless the peer for
++ * the AP (BSSID) already exists. mac80211 assigns the chanctx before it adds
++ * the AP station, so remember the channel and start the vdev from sta_state.
++ */
++static bool ath10k_wcn3990_delay_vdev_start(struct ath10k *ar,
++					    struct ieee80211_vif *vif)
++{
++	return QCA_REV_WCN3990(ar) && vif->type == NL80211_IFTYPE_STATION &&
++	       !vif->p2p;
++}
++
++static int ath10k_mac_finish_delayed_vdev_start(struct ath10k_vif *arvif)
++{
++	struct ath10k *ar = arvif->ar;
++	int ret;
++
++	if (!arvif->vdev_start_delayed)
++		return 0;
++
++	arvif->vdev_start_delayed = false;
++	ret = ath10k_vdev_start(arvif, &arvif->delayed_chandef);
++	if (ret)
++		ath10k_warn(ar, "failed to start delayed vdev %i on freq %d: %d\n",
++			    arvif->vdev_id,
++			    arvif->delayed_chandef.chan->center_freq, ret);
++	return ret;
++}
++
+ static int
+ ath10k_mac_op_assign_vif_chanctx(struct ieee80211_hw *hw,
+ 				 struct ieee80211_vif *vif,
+@@ -9001,7 +9042,13 @@
+ 		return -EBUSY;
+ 	}
+ 
+-	ret = ath10k_vdev_start(arvif, &ctx->def);
++	if (ath10k_wcn3990_delay_vdev_start(ar, vif)) {
++		arvif->delayed_chandef = ctx->def;
++		arvif->vdev_start_delayed = true;
++		ret = 0;
++	} else {
++		ret = ath10k_vdev_start(arvif, &ctx->def);
++	}
+ 	if (ret) {
+ 		ath10k_warn(ar, "failed to start vdev %i addr %pM on freq %d: %d\n",
+ 			    arvif->vdev_id, vif->addr,
+@@ -9089,10 +9136,15 @@
+ 		arvif->is_up = false;
+ 	}
+ 
+-	ret = ath10k_vdev_stop(arvif);
+-	if (ret)
+-		ath10k_warn(ar, "failed to stop vdev %i: %d\n",
+-			    arvif->vdev_id, ret);
++	if (arvif->vdev_start_delayed) {
++		/* never started in firmware */
++		arvif->vdev_start_delayed = false;
++	} else {
++		ret = ath10k_vdev_stop(arvif);
++		if (ret)
++			ath10k_warn(ar, "failed to stop vdev %i: %d\n",
++				    arvif->vdev_id, ret);
++	}
+ 
+ 	arvif->is_started = false;
+ 

@@ -1,0 +1,40 @@
+--- a/init_functions.sh
++++ b/init_functions.sh
+@@ -399,7 +399,8 @@
+ 			local part_count
+ 			part_count="$(fdisk -l "$partition" 2>/dev/null | grep -cE '^ +[0-9]|^'"$partition")"
+ 			# It's probably the right "disk" if it has 2 partitions on it.
+-			if [ "$part_count" -eq 2 ]; then
++			# willow: 4K-sector image on 512-byte eMMC, fdisk cannot count it
++			if [ "$part_count" -eq 2 ] || [ "$(readlink -f /dev/disk/by-partlabel/userdata)" = "$partition" ]; then
+ 				echo "Mount subpartitions of $partition"
+ 				SUBPARTITION_DEV="$partition"
+ 				# shellcheck disable=SC2086
+@@ -1432,6 +1433,7 @@
+ }
+ 
+ fail_halt_boot() {
++	willow_diag
+ 	beebzzr -b 3 -d 250 &
+ 	export_logs
+ 	debug_shell
+@@ -1440,3 +1442,19 @@
+ 		sleep 1
+ 	done
+ }
++
++willow_diag() {
++	mount -t debugfs none /sys/kernel/debug 2>/dev/null
++	echo 1 > /proc/sys/kernel/printk 2>/dev/null
++	{
++	printf '\033[2J\033[H'
++	echo "===== WILLOW DIAG: dmesg rpm/glink/smem/mbox/hwspin/smmu/err ====="
++	dmesg | grep -iE "rpm|glink|smem|mbox|apcs|hwspin|hwlock|smmu|tcsr|error|fail" | grep -v initcall | sed 's/^\[ *[0-9.]*\] //' | tail -n 28 | fold -w 70
++	echo "===== devices_deferred ====="
++	cat /sys/kernel/debug/devices_deferred 2>&1 | fold -w 70 | head -n 30
++	echo "===== /proc/partitions ====="
++	grep -v ' ram' /proc/partitions | awk '{print $3, $4}' | tr '
++' ' ' | fold -w 70; echo
++	echo "===== DIAG END - telnet 172.16.42.1 ====="
++	} > /dev/tty0 2>&1
++}

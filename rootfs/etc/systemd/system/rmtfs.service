@@ -1,0 +1,12 @@
+[Unit]
+Description=Qualcomm remotefs service (serves modemst1/modemst2/fsg to the modem)
+
+[Service]
+# No -r: rmtfs must NOT stop the modem on exit (stopping MPSS under a live
+# ath10k/IPA hard-locks the SM6125). The modem is booted by arctos-modem.service.
+ExecStart=/usr/sbin/rmtfs -P -s
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

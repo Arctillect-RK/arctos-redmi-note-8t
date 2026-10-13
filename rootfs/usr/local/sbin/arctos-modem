@@ -1,0 +1,9 @@
+#!/bin/sh
+# Boot the modem once rmtfs is serving; never stop it on shutdown
+# (stopping MPSS under a live ath10k/IPA hard-locks the SoC; Android doesn't stop it either).
+for r in /sys/class/remoteproc/remoteproc*; do
+  if [ "$(cat "$r/name")" = modem ] && [ "$(cat "$r/state")" = offline ]; then
+    echo start > "$r/state"
+  fi
+done
+exit 0

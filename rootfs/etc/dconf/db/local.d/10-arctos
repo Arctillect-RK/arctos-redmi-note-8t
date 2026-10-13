@@ -1,0 +1,22 @@
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+
+[org/gnome/desktop/session]
+idle-delay=uint32 0
+
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-ac-type='nothing'
+sleep-inactive-battery-type='nothing'
+
+[org/gnome/desktop/interface]
+enable-animations=false
+clock-show-date=false
+icon-theme='ArctOS'
+color-scheme='prefer-dark'
+
+[org/gnome/desktop/background]
+picture-uri='file:///usr/share/wallpapers/arctos/wallpaper-navy.png'
+picture-uri-dark='file:///usr/share/wallpapers/arctos/wallpaper-navy.png'
+
+[sm/puri/phosh]
+app-filter-mode=@as []

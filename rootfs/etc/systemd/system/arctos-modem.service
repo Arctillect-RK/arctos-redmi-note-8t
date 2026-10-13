@@ -1,0 +1,13 @@
+[Unit]
+Description=Boot the modem (MPSS) after rmtfs/tqftpserv; never stop it on shutdown
+After=rmtfs.service tqftpserv.service
+Wants=rmtfs.service tqftpserv.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/local/sbin/arctos-modem
+
+[Install]
+WantedBy=multi-user.target
